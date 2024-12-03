@@ -1,0 +1,72 @@
+name: Thor.Scanner
+description: |
+   Generic artifact for THOR (LITE) forensic scanner.
+
+author: Abdelghani ATTATFA
+
+type: CLIENT
+
+precondition: SELECT OS FROM info() where OS = 'windows' or OS = "linux" or OS = "darwin"
+
+tools:
+  - name: ThorZIP
+    url: https://github.com/AegAtt/tools/raw/main/thor.zip
+
+parameters:
+  - name: CMDLine
+    description: Thor command line flags. In most cases leaving empty is fine, see https://thor-manual.nextron-systems.com/en/latest/usage/scan.html#scan for more informations.
+    default: ""
+
+sources:
+    - name: ThorExec
+      description: Executes THOR with the given parameters and uploads reports.
+      query: |
+        LET Arch <= SELECT Architecture FROM info()
+        LET Thorzip <= SELECT FullPath FROM Artifact.Generic.Utils.FetchBinary(ToolName="ThorZIP", IsExecutable=FALSE)
+        LET TmpDir <= tempdir(remove_last=TRUE)
+        LET Unzip <= SELECT * FROM unzip(filename=Thorzip.FullPath, output_directory=TmpDir)
+
+        LET Executable <= SELECT F FROM switch(
+          a={
+            SELECT TmpDir + if(condition=Arch["Architecture"] =~ "amd64", then="\\thor64-lite.exe", else="\\thor-lite.exe") as F FROM info() WHERE OS = "windows"
+          },
+          b={
+            SELECT TmpDir + if(condition=Arch["Architecture"] =~ "amd64", then="/thorlite/thor-lite-linux-64", else="/thor-lite-linux") as F FROM info() WHERE OS = "linux"
+          },
+          c={
+            SELECT TmpDir + "/thor-lite-macosx" as F FROM info() WHERE OS = "darwin"
+          }
+        )
+
+        LET CMDs <= SELECT C FROM switch (
+          a={
+            SELECT commandline_split(command=CMDLine) as C FROM info() WHERE OS = "windows"
+          },
+          b={
+            SELECT commandline_split(command=CMDLine, bash_style=TRUE) as C FROM info() WHERE OS = "linux" OR OS = "darwin"
+          }
+        )
+
+        LET Chmod <= SELECT * FROM if(
+          condition={SELECT OS FROM info() WHERE NOT OS =~ "windows" },
+          then={SELECT * FROM execve(argv=["chmod", "+x", Executable[0].F])}
+        )
+
+        LET Exec <= SELECT * FROM execve(argv=array(
+          a=[(Executable[0]).F, "--json", "-e", TmpDir], 
+          b=[if(condition= CMDLine = "" OR CMDLine = "." OR CMDLine = " ", then=[], else=(CMDs[0]).C)]
+          )
+        )
+
+        LET Uploaded <= SELECT Name, upload(file=OSPath) as FileDetails FROM glob(globs="/*", root=TmpDir) WHERE Name =~ "(csv|txt|html|json)$"
+
+        LET Numbers <= parse_string_with_regex(string=Exec.Stdout, regex='''ALERTS: (?P<Alerts>\d*) WARNINGS: (?P<Warnings>\d*) NOTICES: (?P<Notices>\d*) ERRORS: (?P<Errors>\d*)''')
+        SELECT * FROM Numbers
+
+    - name: ThorResultsJson
+      description: THOR results in JSON.
+      query: |
+        LET JsonFile <= SELECT OSPath, Size FROM glob(globs="/*", root=TmpDir) WHERE Name =~ "json$" LIMIT 1
+        LET FileContent <= read_file(filename=JsonFile[0].OSPath, length=atoi(string=JsonFile[0].Size))
+        LET JsonContent <= SELECT parse_json(data=_value) as Line FROM foreach(row=split(string=FileContent, sep="\n"))
+        Select Line.hostname as Hostname, Line.level as Level, Line.module as Module, Line.message as Message, Line.scanid as Scanid, Line.log_version as Log_version, Line from JsonContent
